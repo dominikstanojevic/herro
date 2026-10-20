@@ -682,12 +682,23 @@ fn get_supported<S>(bases: &ArrayBase<S, Ix2>) -> Vec<SupportedPos>
 where
     S: Data<Elem = u8>,
 {
-    let mut counter: HashMap<u8, usize> = HashMap::default();
-    counter.insert(b'A', 0);
-    counter.insert(b'C', 0);
-    counter.insert(b'G', 0);
-    counter.insert(b'T', 0);
-    counter.insert(b'*', 0);
+    // Byte -> counter slot (A, C, G, T, *); 255 = not a counted class (panics on index, as the old map lookup did).
+    const BASE_CLASS: [u8; 128] = {
+        let mut t = [255u8; 128];
+        let mut i = 0;
+        while i < 128 {
+            t[i] = match BASE_FORWARD[i] {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                b'*' => 4,
+                _ => 255,
+            };
+            i += 1;
+        }
+        t
+    };
 
     let mut supporeted = Vec::new();
 
@@ -700,19 +711,19 @@ where
             ins = 0;
         }
 
-        counter.iter_mut().for_each(|(_, c)| *c = 0);
+        let mut counter = [0usize; 5];
         col.iter().for_each(|&b| {
             if b == b'.' {
                 return;
             }
 
-            *counter.get_mut(&BASE_FORWARD[b as usize]).unwrap() += 1;
+            counter[BASE_CLASS[b as usize] as usize] += 1;
         });
 
         let thresh = (bases.len_of(Axis(1)) as f64 * 0.1) as usize;
         let n_supported = counter
             .iter()
-            .fold(0u8, |acc, (_, &c)| if c >= thresh { acc + 1 } else { acc });
+            .fold(0u8, |acc, &c| if c >= thresh { acc + 1 } else { acc });
         if n_supported >= 2 {
             supporeted.push(SupportedPos::new(tpos as u16, ins));
         }
