@@ -1,6 +1,5 @@
 use npyz::WriterBuilder;
 use rustc_hash::FxHashMap as HashMap;
-use rustc_hash::FxHashSet as HashSet;
 use std::cmp::Reverse;
 use std::fs::{create_dir_all, File};
 use std::io::prelude::*;
@@ -468,23 +467,21 @@ pub(crate) fn extract_features<'a, T: FeaturesOutput<'a>>(
             .filter(|&(_, b)| *b != b'*')
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
-        let indices = supported
+        let mut indices = supported
             .iter()
             .map(|s| pos_to_idx[s.pos as usize] + s.ins as usize)
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices.dedup();
 
         let tgt = bases.slice(s![.., 0]);
 
         for (qid, row_idx) in qids.iter().zip(1..) {
             let qry = bases.slice(s![.., row_idx]);
 
-            for (pos, (tgt_b, qry_b)) in tgt.iter().zip(qry.iter()).enumerate() {
-                if !indices.contains(&pos) {
-                    continue;
-                }
-
-                let t = (*tgt_b as char).to_ascii_uppercase();
-                let q = (*qry_b as char).to_ascii_uppercase();
+            for &pos in indices.iter() {
+                let t = (tgt[pos] as char).to_ascii_uppercase();
+                let q = (qry[pos] as char).to_ascii_uppercase();
 
                 if t == '*' {
                     continue;
