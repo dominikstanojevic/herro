@@ -383,7 +383,7 @@ pub(crate) fn extract_features<'a, T: FeaturesOutput<'a>>(
         });
 
         // Sort window to take TOP-K
-        windows[i].sort_by_key(|ow| {
+        windows[i].sort_by_cached_key(|ow| {
             let cigar = ovlps_cigar_map
                 .get(&ow.overlap.return_other_id(rid))
                 .unwrap();
