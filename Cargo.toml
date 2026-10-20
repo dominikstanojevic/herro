@@ -33,6 +33,7 @@ rustc-hash = "~1.1.0"
 glob = "~0.3.1"
 zstd = "~0.13.0"
 jemallocator = "~0.5.4"
+flate2 = { version = "~1.1.10", features = ["zlib-rs"] }
 
 [dev-dependencies]
 approx = "~0.5.1"
