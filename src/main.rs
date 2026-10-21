@@ -112,6 +112,11 @@ struct InferenceArgs {
 }
 
 fn main() {
+    // Disable cuBLASLt's process-wide heuristics cache; its lock serialises the per-GPU
+    // inference threads. libcublasLt reads this variable lazily on first use, so it must be
+    // set here, before any thread is spawned or any CUDA work is done.
+    std::env::set_var("CUBLASLT_HEURISTICS_CACHE_CAPACITY", "0");
+
     let cli = Cli::parse();
 
     match cli.command {
