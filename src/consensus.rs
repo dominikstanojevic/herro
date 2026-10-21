@@ -175,12 +175,17 @@ fn consensus(data: ConsensusData, counts: &mut [u8], read: &HAECRecord) -> Optio
                 }
             } else {
                 // Count bases
-                counts.iter_mut().for_each(|c| *c = 0);
+                // Packed in one register: counter i is byte i (n_rows <= 255, so no carry)
+                let mut packed = 0u64;
                 col.iter().for_each(|&b| {
                     if b != BASES_MAP[b'.' as usize] {
-                        counts[BASES_UPPER_COUNTER[b as usize]] += 1;
+                        packed += 1u64 << (8 * BASES_UPPER_COUNTER[b as usize]);
                     }
                 });
+                counts
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, c)| *c = (packed >> (8 * i)) as u8);
 
                 // Get two most common bases and counts - (c, b)
                 let (mc0, mc1) = counts
