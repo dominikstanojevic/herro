@@ -160,16 +160,37 @@ fn decode<R: RangeBounds<usize>>(
         return;
     }
 
-    let rc_mask = if is_reversed { 3 } else { 0 };
-    (start..end).into_iter().for_each(|mut i| {
-        let idx = i - start;
-        if is_reversed {
-            i = end - idx - 1;
+    let out = &mut buffer[..end - start];
+    let mut idx = 0;
+    if !is_reversed {
+        // Walk words forward; base i is bits 2*(i % 32).. of word i / 32.
+        let mut pos = start;
+        while pos < end {
+            let n = (32 - (pos & 31)).min(end - pos);
+            let mut word = sequence[pos >> 5] >> ((pos & 31) << 1);
+            for b in &mut out[idx..idx + n] {
+                *b = BASE_DECODING[(word & 3) as usize];
+                word >>= 2;
+            }
+            idx += n;
+            pos += n;
         }
-
-        let code = ((sequence[i >> 5] >> ((i << 1) & 63)) & 3) ^ rc_mask;
-        buffer[idx] = BASE_DECODING[code as usize];
-    });
+    } else {
+        // Walk words backward from end - 1, emitting complemented bases.
+        // The current base is kept in the top 2 bits of `word`.
+        let mut pos = end;
+        while pos > start {
+            let last = pos - 1;
+            let n = ((last & 31) + 1).min(pos - start);
+            let mut word = sequence[last >> 5] << ((31 - (last & 31)) << 1);
+            for b in &mut out[idx..idx + n] {
+                *b = BASE_DECODING[((word >> 62) ^ 3) as usize];
+                word <<= 2;
+            }
+            idx += n;
+            pos -= n;
+        }
+    }
 }
 
 pub(crate) fn bytes_to_u32(bytes: &[u8]) -> u32 {
