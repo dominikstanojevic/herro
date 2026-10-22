@@ -188,14 +188,17 @@ fn consensus(data: ConsensusData, counts: &mut [u8], read: &HAECRecord) -> Optio
                     .for_each(|(i, c)| *c = (packed >> (8 * i)) as u8);
 
                 // Get two most common bases and counts - (c, b)
-                let (mc0, mc1) = counts
-                    .iter()
-                    .enumerate()
-                    .sorted_by_key(|(_, c)| Reverse(*c))
-                    .take(2)
-                    .map(|(i, c)| (*c, BASES_UPPER[i]))
-                    .collect_tuple()
-                    .unwrap();
+                // Same as a stable sort by Reverse(count): ties keep the lower index first
+                let (mut i0, mut i1) = if counts[1] > counts[0] { (1, 0) } else { (0, 1) };
+                for i in 2..counts.len() {
+                    if counts[i] > counts[i0] {
+                        i1 = i0;
+                        i0 = i;
+                    } else if counts[i] > counts[i1] {
+                        i1 = i;
+                    }
+                }
+                let (mc0, mc1) = ((counts[i0], BASES_UPPER[i0]), (counts[i1], BASES_UPPER[i1]));
                 let tbase = BASES_UPPER[col[0] as usize];
 
                 let base = if mc0.0 < 2 || (mc0.0 == mc1.0 && (mc0.1 == tbase || mc1.1 == tbase)) {
