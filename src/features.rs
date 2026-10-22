@@ -696,6 +696,8 @@ where
         }
         t
     };
+    // Packed-counter increment per class (index 255 panics, as counter[255] did).
+    const CLASS_INC: [u64; 5] = [1, 1 << 12, 1 << 24, 1 << 36, 1 << 48];
 
     let mut supporeted = Vec::new();
 
@@ -709,13 +711,21 @@ where
         }
 
         let mut counter = [0usize; 5];
-        col.iter().for_each(|&b| {
-            if b == b'.' {
-                return;
-            }
+        // Count in one register: class i is bits 12*i..12*i+12; chunks of <= 4095 bytes, so no carry.
+        for chunk in col.axis_chunks_iter(Axis(0), 4095) {
+            let mut packed = 0u64;
+            chunk.iter().for_each(|&b| {
+                if b == b'.' {
+                    return;
+                }
 
-            counter[BASE_CLASS[b as usize] as usize] += 1;
-        });
+                packed += CLASS_INC[BASE_CLASS[b as usize] as usize];
+            });
+            counter
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, c)| *c += ((packed >> (12 * i)) & 0xFFF) as usize);
+        }
 
         let thresh = (bases.len_of(Axis(1)) as f64 * 0.1) as usize;
         let n_supported = counter
