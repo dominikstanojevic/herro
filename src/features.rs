@@ -533,48 +533,41 @@ pub(crate) fn extract_features<'a, T: FeaturesOutput<'a>>(
         let mut sr = (0..iden.len()).collect::<Vec<_>>();
         sr.sort_by_key(|&i| Reverse(iden[i]));
 
-        let mut new_bases = Vec::new();
-        let mut new_quals = Vec::new();
+        let src_cols: Vec<usize> = sr
+            .iter()
+            .take(TOP_K_SORT + 1)
+            .copied()
+            .chain(sr.len()..TOP_K_SORT + 1)
+            .collect();
 
-        for &i in sr.iter().take(TOP_K_SORT + 1) {
-            new_bases.push(bases.index_axis(Axis(1), i));
-            new_quals.push(quals.index_axis(Axis(1), i));
-        }
-        for i in sr.len()..TOP_K_SORT + 1 {
-            new_bases.push(bases.index_axis(Axis(1), i));
-            new_quals.push(quals.index_axis(Axis(1), i));
-        }
+        assert_eq!(src_cols.len(), TOP_K_SORT + 1);
 
-        assert_eq!(new_bases.len(), TOP_K_SORT + 1);
-        assert_eq!(new_quals.len(), TOP_K_SORT + 1);
-
-        let new_bases = stack(Axis(1), &new_bases).unwrap();
-        let retain_idx: Vec<_> = new_bases
-            .axis_iter(Axis(0))
-            .enumerate()
-            .filter_map(|(pos, col)| {
-                let all_gap = col
+        let retain_idx: Vec<_> = (0..bases.len_of(Axis(0)))
+            .filter(|&pos| {
+                let row = bases.row(pos);
+                let all_gap = src_cols
                     .iter()
-                    .filter(|&b| *b != b'.')
-                    .all(|&b| b == b'*' || b == b'#');
-                if all_gap {
-                    None
-                } else {
-                    Some(pos)
-                }
+                    .map(|&c| row[c])
+                    .filter(|&b| b != b'.')
+                    .all(|b| b == b'*' || b == b'#');
+                !all_gap
             })
             .collect();
 
-        let new_bases = new_bases
-            .select(Axis(0), &retain_idx)
-            .as_standard_layout()
-            .to_owned();
+        let mut new_bases = Vec::with_capacity(retain_idx.len() * (TOP_K_SORT + 1));
+        let mut new_quals = Vec::with_capacity(retain_idx.len() * (TOP_K_SORT + 1));
+        for &pos in retain_idx.iter() {
+            let (brow, qrow) = (bases.row(pos), quals.row(pos));
+            for &c in src_cols.iter() {
+                new_bases.push(brow[c]);
+                new_quals.push(qrow[c]);
+            }
+        }
 
-        let new_quals = stack(Axis(1), &new_quals)
-            .unwrap()
-            .select(Axis(0), &retain_idx)
-            .as_standard_layout()
-            .to_owned();
+        let new_bases =
+            Array2::from_shape_vec((retain_idx.len(), TOP_K_SORT + 1), new_bases).unwrap();
+        let new_quals =
+            Array2::from_shape_vec((retain_idx.len(), TOP_K_SORT + 1), new_quals).unwrap();
 
         let supported = get_supported(&new_bases);
 
