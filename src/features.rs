@@ -107,8 +107,8 @@ fn get_query_region(window: &OverlapWindow, tid: u32) -> (u32, u32) {
 }
 
 fn get_features_for_ol_window(
-    mut bases: ArrayViewMut1<'_, u8>,
-    mut quals: ArrayViewMut1<'_, u8>,
+    bases: ArrayViewMut1<'_, u8>,
+    quals: ArrayViewMut1<'_, u8>,
     window: &OverlapWindow,
     cigar: &[u8],
     query: &HAECRecord,
@@ -124,33 +124,57 @@ fn get_features_for_ol_window(
         (window.overlap.tstart, window.overlap.tend)
     };
 
-    let mut query_iter: Box<dyn DoubleEndedIterator<Item = (&u8, &u8)>> =
-        match window.overlap.strand {
-            Strand::Forward => {
-                let range = (qstart + window.qstart) as usize..(qstart + window.qend) as usize;
-                let qlen = (window.qend - window.qstart) as usize;
+    match window.overlap.strand {
+        Strand::Forward => {
+            let range = (qstart + window.qstart) as usize..(qstart + window.qend) as usize;
+            let qlen = (window.qend - window.qstart) as usize;
 
-                query.seq.get_subseq(range.clone(), qbuffer);
-                let quals = &query.qual[range];
+            query.seq.get_subseq(range.clone(), qbuffer);
+            let qquals = &query.qual[range];
 
-                Box::new(qbuffer[..qlen].iter().zip(quals))
-            }
-            Strand::Reverse => {
-                let range = (qend - window.qend) as usize..(qend - window.qstart) as usize;
-                let qlen = (window.qend - window.qstart) as usize;
+            write_ol_window_features(
+                qbuffer[..qlen].iter().zip(qquals),
+                bases,
+                quals,
+                window,
+                cigar,
+                offset,
+                max_ins,
+            )
+        }
+        Strand::Reverse => {
+            let range = (qend - window.qend) as usize..(qend - window.qstart) as usize;
+            let qlen = (window.qend - window.qstart) as usize;
 
-                query.seq.get_rc_subseq(range.clone(), qbuffer);
-                let quals = &query.qual[range];
+            query.seq.get_rc_subseq(range.clone(), qbuffer);
+            let qquals = &query.qual[range];
 
-                Box::new(
-                    qbuffer[..qlen]
-                        .iter()
-                        .zip(quals.iter().rev())
-                        .map(|(b, q)| (&BASE_LOWER[*b as usize], q)),
-                )
-            }
-        };
+            write_ol_window_features(
+                qbuffer[..qlen]
+                    .iter()
+                    .zip(qquals.iter().rev())
+                    .map(|(b, q)| (&BASE_LOWER[*b as usize], q)),
+                bases,
+                quals,
+                window,
+                cigar,
+                offset,
+                max_ins,
+            )
+        }
+    }
+}
 
+// Generic over the query iterator so each strand case is monomorphised (no per-base virtual call).
+fn write_ol_window_features<'a>(
+    mut query_iter: impl Iterator<Item = (&'a u8, &'a u8)>,
+    mut bases: ArrayViewMut1<'_, u8>,
+    mut quals: ArrayViewMut1<'_, u8>,
+    window: &OverlapWindow,
+    cigar: &[u8],
+    offset: usize,
+    max_ins: &[u16],
+) {
     let cigar = CigarIter::new(&cigar[window.cigar_start_idx..window.cigar_end_idx]);
 
     // Get features
