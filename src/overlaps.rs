@@ -171,7 +171,7 @@ pub fn parse_paf(
         let tstart: u32 = bytes_to_u32(data.next().unwrap());
         let tend: u32 = bytes_to_u32(data.next().unwrap());
 
-        let cigar = data.last().unwrap()[5..].to_owned();
+        let cigar = &data.last().unwrap()[5..];
         //let cigar = parse_cigar(&cigar[5..]);
 
         if tid == qid {
@@ -187,7 +187,7 @@ pub fn parse_paf(
         processed.insert((qid, tid));
 
         let overlap = Overlap::new(qid, qlen, qstart, qend, strand, tid, tlen, tstart, tend);
-        let alignment = Alignment::new(overlap, cigar);
+        let alignment = Alignment::new(overlap, cigar.to_owned());
         tid_to_alns
             .entry(tid)
             .or_insert_with(|| Vec::new())
