@@ -1,8 +1,13 @@
 use core::panic;
-use std::{ops::RangeBounds, path::Path};
+use std::{collections::BTreeMap, ops::RangeBounds, path::Path, thread};
 
+use crossbeam_channel::{bounded, unbounded};
 use needletail::parse_fastx_file;
 use rustc_hash::FxHashSet;
+
+// get_reads: worker threads (id split, 2-bit encode, core/neighbour filter) and records per chunk.
+const PARSE_WORKERS: usize = 4;
+const PARSE_CHUNK_SIZE: usize = 64;
 
 const BASE_ENCODING: [u64; 128] = [
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
@@ -42,36 +47,86 @@ pub fn get_reads<P: AsRef<Path>>(
 ) -> Vec<HAECRecord> {
     let mut reader = parse_fastx_file(path).expect("Cannot open file containing reads.");
 
-    let mut reads = Vec::new();
-    while let Some(record) = reader.next() {
-        let record = record.expect("Error parsing fastx file.");
-        if record.num_bases() < min_length as usize {
-            continue;
+    // This thread inflates and splits records; workers build HAECRecords from owned copies.
+    // Chunks carry a sequence number and are appended in that order, so `reads` keeps file order.
+    let (chunk_sender, chunk_receiver) =
+        bounded::<(usize, Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>)>(2 * PARSE_WORKERS);
+    let (recs_sender, recs_receiver) = unbounded::<(usize, Vec<HAECRecord>)>();
+
+    thread::scope(|s| {
+        for _ in 0..PARSE_WORKERS {
+            let chunk_receiver = chunk_receiver.clone();
+            let recs_sender = recs_sender.clone();
+
+            s.spawn(move || {
+                for (i, chunk) in chunk_receiver {
+                    let mut recs = Vec::with_capacity(chunk.len());
+                    for (line, seq, qual) in chunk {
+                        let mut split = line.splitn(2, |c| *c == b' ' || *c == b'\t');
+                        let id = split.next().expect("Invalid read id.").to_owned();
+                        let description = split.next().map(|d| d.to_owned());
+
+                        let seq = HAECSeq::from(&*seq);
+
+                        if let (Some(core), Some(neighbour)) = (&core, &neighbour) {
+                            if !neighbour.contains(std::str::from_utf8(&id).unwrap())
+                                && !core.contains(std::str::from_utf8(&id).unwrap())
+                            {
+                                continue;
+                            }
+                        }
+
+                        recs.push(HAECRecord::new(id, description, seq, qual));
+                    }
+                    recs_sender.send((i, recs)).unwrap();
+                }
+            });
         }
+        drop(recs_sender);
 
-        let mut split = record.id().splitn(2, |c| *c == b' ' || *c == b'\t');
-        let id = split.next().expect("Invalid read id.").to_owned();
-        let description = split.next().map(|d| d.to_owned());
+        let collector = s.spawn(move || {
+            let mut reads = Vec::new();
+            let mut pending = BTreeMap::new();
+            let mut next = 0;
+            for (i, recs) in recs_receiver {
+                pending.insert(i, recs);
+                while let Some(recs) = pending.remove(&next) {
+                    reads.extend(recs);
+                    next += 1;
+                }
+            }
 
-        let seq = HAECSeq::from(&*record.seq());
-        let qual = record
-            .qual()
-            .expect("Qualities should be present.")
-            .to_owned();
+            reads.shrink_to_fit();
+            reads
+        });
 
-        if let (Some(core), Some(neighbour)) = (&core, &neighbour) {
-            if !neighbour.contains(std::str::from_utf8(&id).unwrap())
-                && !core.contains(std::str::from_utf8(&id).unwrap())
-            {
+        let mut n_chunks = 0;
+        let mut chunk = Vec::with_capacity(PARSE_CHUNK_SIZE);
+        while let Some(record) = reader.next() {
+            let record = record.expect("Error parsing fastx file.");
+            if record.num_bases() < min_length as usize {
                 continue;
             }
+
+            let qual = record
+                .qual()
+                .expect("Qualities should be present.")
+                .to_owned();
+            chunk.push((record.id().to_owned(), record.seq().into_owned(), qual));
+
+            if chunk.len() == PARSE_CHUNK_SIZE {
+                chunk_sender.send((n_chunks, chunk)).unwrap();
+                n_chunks += 1;
+                chunk = Vec::with_capacity(PARSE_CHUNK_SIZE);
+            }
         }
+        if !chunk.is_empty() {
+            chunk_sender.send((n_chunks, chunk)).unwrap();
+        }
+        drop(chunk_sender);
 
-        reads.push(HAECRecord::new(id, description, seq, qual));
-    }
-
-    reads.shrink_to_fit();
-    reads
+        collector.join().unwrap()
+    })
 }
 
 #[derive(PartialEq, Debug)]
