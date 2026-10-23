@@ -143,6 +143,9 @@ pub fn parse_paf(
 
     let mut buffer = Vec::new();
     let mut processed = HashSet::default();
+    // Last query name and its lookup result (consecutive lines usually share the query).
+    let mut last_qname: Vec<u8> = Vec::new();
+    let mut last_qid = name_to_id.get(&last_qname[..]).copied();
 
     //let mut alignments = Vec::new();
     let mut tid_to_alns = HashMap::default();
@@ -153,8 +156,14 @@ pub fn parse_paf(
 
         let mut data = buffer[..len - 1].split(|&c| c == b'\t');
 
-        let qid = match name_to_id.get(data.next().unwrap()) {
-            Some(qid) => *qid,
+        let qname = data.next().unwrap();
+        if qname != &last_qname[..] {
+            last_qid = name_to_id.get(qname).copied();
+            last_qname.clear();
+            last_qname.extend_from_slice(qname);
+        }
+        let qid = match last_qid {
+            Some(qid) => qid,
             None => {
                 buffer.clear();
                 continue;
