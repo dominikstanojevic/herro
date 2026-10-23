@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use glob::glob;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -9,10 +9,12 @@ use std::fmt;
 
 use std::fs::create_dir_all;
 use std::fs::File;
+use std::io;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::aligners::{cigar_to_string, CigarOp};
 use crate::haec_io::bytes_to_u32;
@@ -285,40 +287,131 @@ where
         })
 }
 
+pub(crate) const PREFETCH_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+/// First batch file (glob order) decompressed by a background thread into chunks.
+pub(crate) struct PrefetchedBatch {
+    path: PathBuf,
+    chunks: Receiver<io::Result<Vec<u8>>>,
+}
+
+pub(crate) fn prefetch_first_batch<P: AsRef<Path>>(batches: P) -> Option<PrefetchedBatch> {
+    let g = batches.as_ref().join("*.oec.zst");
+    let path = glob(g.to_str().unwrap()).unwrap().next()?.unwrap();
+
+    let (sender, chunks) = unbounded();
+    let file = File::open(&path).unwrap();
+    thread::spawn(move || {
+        let mut decoder = zstd::Decoder::new(file).unwrap();
+        loop {
+            let mut chunk = Vec::with_capacity(PREFETCH_CHUNK_SIZE);
+            let res = (&mut decoder)
+                .take(PREFETCH_CHUNK_SIZE as u64)
+                .read_to_end(&mut chunk);
+
+            if !chunk.is_empty() && sender.send(Ok(chunk)).is_err() {
+                break;
+            }
+            match res {
+                Ok(0) => break,
+                Ok(_) => (),
+                Err(e) => {
+                    let _ = sender.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
+    Some(PrefetchedBatch { path, chunks })
+}
+
+/// Reads the prefetched chunks in order, dropping each one once consumed.
+struct ChunkReader {
+    chunks: Receiver<io::Result<Vec<u8>>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.fill_buf()?.read(buf)?;
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for ChunkReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos == self.chunk.len() {
+            if let Ok(chunk) = self.chunks.recv() {
+                self.chunk = chunk?;
+                self.pos = 0;
+            }
+        }
+        Ok(&self.chunk[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt;
+    }
+}
+
+fn read_batch(
+    mut reader: impl BufRead,
+    name_to_id: &HashMap<&[u8], u32>,
+    core: &Option<HashSet<String>>,
+) -> HashMap<u32, Vec<Alignment>> {
+    // Read number of target reads
+    let mut buf = Vec::new();
+    let len = reader.read_until(LINE_ENDING, &mut buf).unwrap();
+    let n_targets = buf[..len - 1]
+        .iter()
+        .fold(0, |acc, &d| acc * 10 + (d - b'0') as u32);
+
+    let _tids: HashSet<_> = (0..n_targets)
+        .filter_map(|_| {
+            buf.clear();
+            let len = reader.read_until(LINE_ENDING, &mut buf).unwrap();
+
+            name_to_id.get(&buf[..len - 1]).copied()
+        })
+        .collect();
+
+    parse_paf(&mut reader, name_to_id, core, None)
+}
+
 pub(crate) fn read_batches<'a, P>(
     name_to_id: &'a HashMap<&[u8], u32>,
     core: &'a Option<HashSet<String>>,
     batches: P,
+    mut first_batch: Option<PrefetchedBatch>,
 ) -> impl Iterator<Item = HashMap<u32, Vec<Alignment>>> + 'a
 where
     P: AsRef<Path>,
     P: 'a,
 {
     let g = batches.as_ref().join("*.oec.zst");
-    glob(g.to_str().unwrap()).unwrap().map(|p| {
-        let mut reader = {
-            let file = File::open(p.unwrap()).unwrap();
-            let reader = zstd::Decoder::new(file).unwrap();
-            BufReader::with_capacity(65_536, reader)
-        };
-
-        // Read number of target reads
-        let mut buf = Vec::new();
-        let len = reader.read_until(LINE_ENDING, &mut buf).unwrap();
-        let n_targets = buf[..len - 1]
-            .iter()
-            .fold(0, |acc, &d| acc * 10 + (d - b'0') as u32);
-
-        let _tids: HashSet<_> = (0..n_targets)
-            .filter_map(|_| {
-                buf.clear();
-                let len = reader.read_until(LINE_ENDING, &mut buf).unwrap();
-
-                name_to_id.get(&buf[..len - 1]).copied()
-            })
-            .collect();
-
-        parse_paf(&mut reader, name_to_id, core, None)
+    glob(g.to_str().unwrap()).unwrap().map(move |p| {
+        let p = p.unwrap();
+        match first_batch.take() {
+            Some(prefetched) if prefetched.path == p => {
+                let reader = ChunkReader {
+                    chunks: prefetched.chunks,
+                    chunk: Vec::new(),
+                    pos: 0,
+                };
+                read_batch(reader, name_to_id, core)
+            }
+            _ => {
+                let reader = {
+                    let file = File::open(p).unwrap();
+                    let reader = zstd::Decoder::new(file).unwrap();
+                    BufReader::with_capacity(65_536, reader)
+                };
+                read_batch(reader, name_to_id, core)
+            }
+        }
     })
 }
 
@@ -328,6 +421,7 @@ pub(crate) fn alignment_reader<T: AsRef<Path>, U: AsRef<Path>>(
     core: &Option<HashSet<String>>,
     aln_mode: AlnMode<U>,
     n_threads: usize,
+    first_batch: Option<PrefetchedBatch>,
     alns_sender: Sender<(u32, Vec<Alignment>)>,
     pbar_sender: Sender<PBarNotification>,
 ) {
@@ -343,7 +437,7 @@ pub(crate) fn alignment_reader<T: AsRef<Path>, U: AsRef<Path>>(
             Box::new(batches)
         }
         AlnMode::Read(path) => {
-            let batches = read_batches(&name_to_id, &core, path);
+            let batches = read_batches(&name_to_id, &core, path, first_batch);
             Box::new(batches)
         }
         AlnMode::Write(path) => {

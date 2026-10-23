@@ -23,7 +23,7 @@ use crate::{
     consensus::consensus_worker,
     features::{FeatsGenOutput, InferenceOutput},
     inference::inference_worker,
-    overlaps::alignment_reader,
+    overlaps::{alignment_reader, prefetch_first_batch},
 };
 
 mod aligners;
@@ -73,6 +73,7 @@ pub fn generate_features<T, U, V>(
                 &None,
                 aln_mode,
                 threads,
+                None,
                 alns_sender,
                 pbar_s,
             )
@@ -130,6 +131,11 @@ pub fn error_correction<T, U, V>(
     tch::set_num_threads(1);
 
     let (core, neighbour) = read_cluster(&cluster_path);
+    // Decompress the first alignment batch while the reads are parsed
+    let first_batch = match &aln_mode {
+        AlnMode::Read(path) => prefetch_first_batch(path),
+        _ => None,
+    };
     let reads = parse_reads(&reads_path, window_size, &core, &neighbour);
     let max_len = reads.iter().map(|r| r.seq.len()).max().unwrap();
 
@@ -145,6 +151,7 @@ pub fn error_correction<T, U, V>(
                 &core,
                 aln_mode,
                 threads,
+                first_batch,
                 alns_sender,
                 pbar_s,
             )
