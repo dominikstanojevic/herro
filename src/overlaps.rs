@@ -302,24 +302,38 @@ pub(crate) fn prefetch_first_batch<P: AsRef<Path>>(batches: P) -> Option<Prefetc
     let (sender, chunks) = unbounded();
     let file = File::open(&path).unwrap();
     thread::spawn(move || {
-        let mut decoder = zstd::Decoder::new(file).unwrap();
+        // Same reader as read_batches, so the decoder sees the same read sizes
+        let mut reader = BufReader::with_capacity(65_536, zstd::Decoder::new(file).unwrap());
+        let mut chunk = Vec::with_capacity(PREFETCH_CHUNK_SIZE);
         loop {
-            let mut chunk = Vec::with_capacity(PREFETCH_CHUNK_SIZE);
-            let res = (&mut decoder)
-                .take(PREFETCH_CHUNK_SIZE as u64)
-                .read_to_end(&mut chunk);
-
-            if !chunk.is_empty() && sender.send(Ok(chunk)).is_err() {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let _ = sender.send(Ok(chunk));
+                    }
+                    let _ = sender.send(Err(e));
+                    return;
+                }
+            };
+            if available.is_empty() {
                 break;
             }
-            match res {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(e) => {
-                    let _ = sender.send(Err(e));
-                    break;
+
+            let n = available.len().min(PREFETCH_CHUNK_SIZE - chunk.len());
+            chunk.extend_from_slice(&available[..n]);
+            reader.consume(n);
+
+            if chunk.len() == PREFETCH_CHUNK_SIZE {
+                if sender.send(Ok(chunk)).is_err() {
+                    return;
                 }
+                chunk = Vec::with_capacity(PREFETCH_CHUNK_SIZE);
             }
+        }
+        if !chunk.is_empty() {
+            let _ = sender.send(Ok(chunk));
         }
     });
 
@@ -394,7 +408,7 @@ where
     let g = batches.as_ref().join("*.oec.zst");
     glob(g.to_str().unwrap()).unwrap().map(move |p| {
         let p = p.unwrap();
-        match first_batch.take() {
+        match first_batch.take().filter(|f| f.path == p) {
             Some(prefetched) if prefetched.path == p => {
                 let reader = ChunkReader {
                     chunks: prefetched.chunks,
