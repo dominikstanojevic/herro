@@ -180,11 +180,10 @@ pub fn parse_paf(
             continue;
         }
 
-        if processed.contains(&(qid, tid)) {
+        if !processed.insert((qid, tid)) {
             buffer.clear();
             continue; // We assume the first overlap between two reads is the best one
         }
-        processed.insert((qid, tid));
 
         let overlap = Overlap::new(qid, qlen, qstart, qend, strand, tid, tlen, tstart, tend);
         let alignment = Alignment::new(overlap, cigar.to_owned());
