@@ -116,6 +116,23 @@ impl PartialEq for Overlap {
 
 impl Eq for Overlap {}
 
+/// Index of the last `b'\t'` in `s`, testing 8 bytes at a time from the end.
+fn rfind_tab(s: &[u8]) -> Option<usize> {
+    const TABS: u64 = u64::from_ne_bytes([b'\t'; 8]);
+    const LO: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HI: u64 = u64::from_ne_bytes([0x80; 8]);
+
+    let mut end = s.len();
+    while end >= 8 {
+        let x = u64::from_ne_bytes(s[end - 8..end].try_into().unwrap()) ^ TABS;
+        if (x.wrapping_sub(LO) & !x & HI) != 0 {
+            break; // s[end - 8..end] contains a tab
+        }
+        end -= 8;
+    }
+    s[..end].iter().rposition(|&c| c == b'\t')
+}
+
 pub fn parse_paf(
     mut reader: impl BufRead,
     name_to_id: &HashMap<&[u8], u32>,
@@ -171,7 +188,10 @@ pub fn parse_paf(
         let tstart: u32 = bytes_to_u32(data.next().unwrap());
         let tend: u32 = bytes_to_u32(data.next().unwrap());
 
-        let cigar = &data.last().unwrap()[5..];
+        // Same slice as `data.last().unwrap()`: a 10th field must exist, the last field follows the last tab.
+        data.next().unwrap();
+        let line = &buffer[..len - 1];
+        let cigar = &line[rfind_tab(line).unwrap() + 1..][5..];
         //let cigar = parse_cigar(&cigar[5..]);
 
         if tid == qid {
