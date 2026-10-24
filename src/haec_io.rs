@@ -47,26 +47,36 @@ pub fn get_reads<P: AsRef<Path>>(
 ) -> Vec<HAECRecord> {
     let mut reader = parse_fastx_file(path).expect("Cannot open file containing reads.");
 
-    // This thread inflates and splits records; workers build HAECRecords from owned copies.
+    // This thread inflates and splits records, appending each record's id, seq and qual (as returned
+    // by needletail) to a chunk buffer, with their end offsets; workers build HAECRecords from it.
     // Chunks carry a sequence number and are appended in that order, so `reads` keeps file order.
     let (chunk_sender, chunk_receiver) =
-        bounded::<(usize, Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>)>(2 * PARSE_WORKERS);
+        bounded::<(usize, Vec<u8>, Vec<[usize; 3]>)>(2 * PARSE_WORKERS);
     let (recs_sender, recs_receiver) = unbounded::<(usize, Vec<HAECRecord>)>();
+    // Workers return emptied chunk buffers, so this thread refills warm memory instead of allocating.
+    let (pool_sender, pool_receiver) = unbounded::<(Vec<u8>, Vec<[usize; 3]>)>();
 
     thread::scope(|s| {
         for _ in 0..PARSE_WORKERS {
             let chunk_receiver = chunk_receiver.clone();
             let recs_sender = recs_sender.clone();
+            let pool_sender = pool_sender.clone();
 
             s.spawn(move || {
-                for (i, chunk) in chunk_receiver {
-                    let mut recs = Vec::with_capacity(chunk.len());
-                    for (line, seq, qual) in chunk {
+                for (i, mut buf, mut ends) in chunk_receiver {
+                    let mut recs = Vec::with_capacity(ends.len());
+                    let mut start = 0;
+                    for &[id_end, seq_end, qual_end] in &ends {
+                        let line = &buf[start..id_end];
+                        let seq = &buf[id_end..seq_end];
+                        let qual = buf[seq_end..qual_end].to_vec();
+                        start = qual_end;
+
                         let mut split = line.splitn(2, |c| *c == b' ' || *c == b'\t');
                         let id = split.next().expect("Invalid read id.").to_owned();
                         let description = split.next().map(|d| d.to_owned());
 
-                        let seq = HAECSeq::from(&*seq);
+                        let seq = HAECSeq::from(seq);
 
                         if let (Some(core), Some(neighbour)) = (&core, &neighbour) {
                             if !neighbour.contains(std::str::from_utf8(&id).unwrap())
@@ -79,6 +89,10 @@ pub fn get_reads<P: AsRef<Path>>(
                         recs.push(HAECRecord::new(id, description, seq, qual));
                     }
                     recs_sender.send((i, recs)).unwrap();
+
+                    buf.clear();
+                    ends.clear();
+                    pool_sender.send((buf, ends)).unwrap();
                 }
             });
         }
@@ -101,27 +115,29 @@ pub fn get_reads<P: AsRef<Path>>(
         });
 
         let mut n_chunks = 0;
-        let mut chunk = Vec::with_capacity(PARSE_CHUNK_SIZE);
+        let (mut buf, mut ends) = pool_receiver.try_recv().unwrap_or_default();
         while let Some(record) = reader.next() {
             let record = record.expect("Error parsing fastx file.");
             if record.num_bases() < min_length as usize {
                 continue;
             }
 
-            let qual = record
-                .qual()
-                .expect("Qualities should be present.")
-                .to_owned();
-            chunk.push((record.id().to_owned(), record.seq().into_owned(), qual));
+            let qual = record.qual().expect("Qualities should be present.");
+            buf.extend_from_slice(record.id());
+            let id_end = buf.len();
+            buf.extend_from_slice(&record.seq());
+            let seq_end = buf.len();
+            buf.extend_from_slice(qual);
+            ends.push([id_end, seq_end, buf.len()]);
 
-            if chunk.len() == PARSE_CHUNK_SIZE {
-                chunk_sender.send((n_chunks, chunk)).unwrap();
+            if ends.len() == PARSE_CHUNK_SIZE {
+                chunk_sender.send((n_chunks, buf, ends)).unwrap();
                 n_chunks += 1;
-                chunk = Vec::with_capacity(PARSE_CHUNK_SIZE);
+                (buf, ends) = pool_receiver.try_recv().unwrap_or_default();
             }
         }
-        if !chunk.is_empty() {
-            chunk_sender.send((n_chunks, chunk)).unwrap();
+        if !ends.is_empty() {
+            chunk_sender.send((n_chunks, buf, ends)).unwrap();
         }
         drop(chunk_sender);
 
