@@ -9,14 +9,21 @@ use rustc_hash::FxHashSet;
 const PARSE_WORKERS: usize = 4;
 const PARSE_CHUNK_SIZE: usize = 64;
 
-const BASE_ENCODING: [u64; 128] = [
+const BASE_ENCODING: [u64; 256] = [
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 0, 255, 1, 255, 255, 255, 2, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 3, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 0, 255, 1, 255, 255, 255, 2, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    3, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    3, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255,
 ];
 
 const BASE_DECODING: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -76,7 +83,10 @@ pub fn get_reads<P: AsRef<Path>>(
                         let id = split.next().expect("Invalid read id.").to_owned();
                         let description = split.next().map(|d| d.to_owned());
 
-                        let seq = HAECSeq::from(seq);
+                        let seq = match encode(seq) {
+                            Ok((data, length)) => HAECSeq::new(data, length),
+                            Err(i) => invalid_base_exit(seq[i], i, &id),
+                        };
 
                         if let (Some(core), Some(neighbour)) = (&core, &neighbour) {
                             if !neighbour.contains(std::str::from_utf8(&id).unwrap())
@@ -175,7 +185,8 @@ impl HAECSeq {
 
 impl From<&[u8]> for HAECSeq {
     fn from(value: &[u8]) -> Self {
-        let (data, length) = encode(value);
+        let (data, length) =
+            encode(value).unwrap_or_else(|i| panic!("Invalid base at position {i}."));
         HAECSeq::new(data, length)
     }
 }
@@ -189,12 +200,16 @@ impl From<&HAECSeq> for Vec<u8> {
     }
 }
 
-fn encode(sequence: &[u8]) -> (Vec<u64>, usize) {
+// Err holds the position of the first base that is not A, C, G or T (either case).
+fn encode(sequence: &[u8]) -> Result<(Vec<u64>, usize), usize> {
     let mut data = Vec::with_capacity((sequence.len() + 31) / 32);
     let mut block = 0;
+    // ORs all codes; any invalid base sets bits above the low two, checked once after the loop.
+    let mut acc = 0;
 
     for (i, b) in sequence.iter().enumerate() {
         let c = BASE_ENCODING[*b as usize];
+        acc |= c;
 
         block |= c << ((i << 1) & 63);
         if (i + 1) & 31 == 0 || i == sequence.len() - 1 {
@@ -203,7 +218,26 @@ fn encode(sequence: &[u8]) -> (Vec<u64>, usize) {
         }
     }
 
-    (data, sequence.len())
+    if acc > 3 {
+        return Err(sequence
+            .iter()
+            .position(|b| BASE_ENCODING[*b as usize] > 3)
+            .unwrap());
+    }
+
+    Ok((data, sequence.len()))
+}
+
+// Called from get_reads' scoped worker threads, before any output exists: exit the whole process
+// here, as a panic would leave the other threads and the in-order chunk reassembly waiting.
+fn invalid_base_exit(base: u8, pos: usize, id: &[u8]) -> ! {
+    eprintln!(
+        "Invalid base '{}' at position {} in read {}. HERRO accepts only A, C, G, T (upper or lower case).",
+        base.escape_ascii(),
+        pos,
+        String::from_utf8_lossy(id)
+    );
+    std::process::exit(1);
 }
 
 fn decode<R: RangeBounds<usize>>(
@@ -285,7 +319,38 @@ mod tests {
         let sequence = "ACGT";
         let result = encode(sequence.as_bytes());
 
-        assert_eq!(result, (vec![0b11100100], 4));
+        assert_eq!(result, Ok((vec![0b11100100], 4)));
+    }
+
+    #[test]
+    fn encode_invalid_bases() {
+        let mut seq = vec![b'A'; 40];
+        for (b, pos) in [
+            (b'N', 5),
+            (b'R', 5),
+            (0x80, 5),
+            (0xFF, 5),
+            (b'N', 0),
+            (b'N', 39),
+            (b'N', 31),
+            (b'N', 32),
+        ] {
+            seq[pos] = b;
+            assert_eq!(encode(&seq), Err(pos));
+            seq[pos] = b'A';
+        }
+
+        // First invalid base is reported
+        let seq = b"ACGTNACGRT";
+        assert_eq!(encode(seq), Err(4));
+    }
+
+    #[test]
+    fn encode_lowercase() {
+        let upper: Vec<u8> = (0..100).map(|i| b"ACGT"[(i * 7 + i / 3) % 4]).collect();
+        let lower = upper.to_ascii_lowercase();
+        assert_eq!(encode(&lower), encode(&upper));
+        assert!(encode(&upper).is_ok());
     }
 
     #[test]
