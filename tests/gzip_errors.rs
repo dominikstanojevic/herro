@@ -44,9 +44,7 @@ fn corrupted_gzip_exits_without_output() {
     let dir: PathBuf = std::env::temp_dir().join(format!("herro-c25-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut e = GzEncoder::new(Vec::new(), Compression::new(6));
-    e.write_all(&fastq()).unwrap();
-    let good = e.finish().unwrap();
+    let good = gz(&fastq());
     let n = good.len();
 
     let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
@@ -74,13 +72,63 @@ fn corrupted_gzip_exits_without_output() {
             reads.display()
         );
         assert!(stderr.contains(&corrupted), "{name} rapidgzip: {stderr}");
-        assert!(stderr.contains("\nrapidgzip-core 0.3.1 error: "), "{name} rapidgzip: {stderr}");
+        // Second line: the decoder's error, or (flipped: bad bytes before the CRC) the parse error.
+        let second = match name {
+            "flipped" => "\nParse error on the rapidgzip path: ",
+            _ => "\nrapidgzip-core 0.3.1 error: ",
+        };
+        assert!(stderr.contains(second), "{name} rapidgzip: {stderr}");
         assert!(!out.exists(), "{name} rapidgzip: output created");
         eprintln!("{name} rapidgzip: {}", stderr.trim_end());
 
         let (code, stderr) = run(&reads, &out, "legacy");
         assert_ne!(code, Some(0), "{name} legacy: {stderr}");
         assert!(stderr.contains("Error parsing fastx file."), "{name} legacy: {stderr}");
+        assert!(!out.exists(), "{name} legacy: output created");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn gz(data: &[u8]) -> Vec<u8> {
+    let mut e = GzEncoder::new(Vec::new(), Compression::new(6));
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+// bzip2 -9 of "@r1\nACGT\n+\nIIII\n".
+const BZ2_FASTQ: [u8; 59] = [
+    0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0xaf, 0x85, 0x72, 0x8b, 0x00, 0x00,
+    0x03, 0xde, 0x80, 0x40, 0x10, 0x00, 0x08, 0x20, 0x00, 0x68, 0xa0, 0x04, 0x00, 0x10, 0x00, 0x20,
+    0x00, 0x22, 0x01, 0xa3, 0x4d, 0x08, 0x06, 0x9a, 0x68, 0x3d, 0x20, 0x05, 0x0c, 0x78, 0xbd, 0x25,
+    0xe2, 0xee, 0x48, 0xa7, 0x0a, 0x12, 0x15, 0xf0, 0xae, 0x51, 0x60,
+];
+
+// Like parse_fastx_file, the rapidgzip path does not look for a second compression layer.
+#[test]
+fn nested_compression_is_rejected_by_both() {
+    let dir: PathBuf = std::env::temp_dir().join(format!("herro-c25-nest-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for (name, data) in [("gz_gz", gz(&gz(&fastq()))), ("gz_bz2", gz(&BZ2_FASTQ))] {
+        let reads = dir.join(format!("{name}.fq.gz"));
+        std::fs::write(&reads, data).unwrap();
+        let out = dir.join(format!("{name}.out"));
+
+        let (code, stderr) = run(&reads, &out, "rapidgzip");
+        assert_eq!(code, Some(1), "{name} rapidgzip: {stderr}");
+        let corrupted = format!(
+            "Reads file {} is corrupted or not valid FASTQ: Expected '@' or '>' at the start",
+            reads.display()
+        );
+        assert!(stderr.contains(&corrupted), "{name} rapidgzip: {stderr}");
+        assert!(stderr.contains("\nParse error on the rapidgzip path: "), "{name}: {stderr}");
+        assert!(!out.exists(), "{name} rapidgzip: output created");
+        eprintln!("{name} rapidgzip: {}", stderr.trim_end());
+
+        let (code, stderr) = run(&reads, &out, "legacy");
+        assert_ne!(code, Some(0), "{name} legacy: {stderr}");
+        assert!(stderr.contains("Cannot open file containing reads."), "{name} legacy: {stderr}");
+        assert!(stderr.contains("UnknownFormat"), "{name} legacy: {stderr}");
         assert!(!out.exists(), "{name} legacy: output created");
     }
     std::fs::remove_dir_all(dir).unwrap();

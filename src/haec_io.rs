@@ -6,7 +6,7 @@ use std::{
     ops::RangeBounds,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
     thread,
@@ -15,7 +15,12 @@ use std::{
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError};
 use flate2::read::MultiGzDecoder;
-use needletail::{errors::ParseError, parse_fastx_file, parse_fastx_reader, FastxReader};
+use needletail::{
+    errors::ParseError,
+    parse_fastx_file,
+    parser::{FastaReader, FastqReader},
+    FastxReader,
+};
 use rapidgzip_core::{DecodeError, Decoder};
 use rustc_hash::FxHashSet;
 
@@ -142,7 +147,7 @@ fn get_reads_rapidgzip(
                     error: &error,
                 };
                 // The reader (and with it all decoding) is dropped before this returns.
-                parse_fastx_reader(tracked)
+                decoded_fastx_reader(tracked)
                     .and_then(|reader| read_records(reader, min_length, core, neighbour, true))
             }
             Err(e) => {
@@ -197,9 +202,13 @@ fn rapidgzip_failure_message(
             rapidgzip_error
         ),
         Err(legacy_error) => format!(
-            "Reads file {} is corrupted or not valid FASTQ: {}\nrapidgzip-core 0.3.1 error: {}",
+            "Reads file {} is corrupted or not valid FASTQ: {}\n{}: {}",
             path.display(),
             legacy_error,
+            match decoder_error {
+                Some(_) => "rapidgzip-core 0.3.1 error",
+                None => "Parse error on the rapidgzip path",
+            },
             rapidgzip_error
         ),
     }
@@ -217,7 +226,7 @@ fn legacy_check(path: &Path) -> Result<(), String> {
         delivered: &delivered,
         error: &error,
     };
-    let result = parse_fastx_reader(tracked).and_then(|mut reader| {
+    let result = decoded_fastx_reader(tracked).and_then(|mut reader| {
         while let Some(record) = reader.next() {
             record?;
         }
@@ -227,6 +236,22 @@ fn legacy_check(path: &Path) -> Result<(), String> {
         Some((e, offset)) => format!("{} (at decompressed byte {})", e, offset),
         None => parse_error.to_string(),
     })
+}
+
+// needletail 0.5.1's gzip branch of parse_fastx_reader, on an already decoded stream: the format
+// comes from the first decoded byte, with no sniffing for another compression layer (so nested
+// gz/bz2/xz is rejected as by parse_fastx_file). No first byte: the io error, as there.
+fn decoded_fastx_reader<'a, R: Read + Send + 'a>(
+    mut reader: R,
+) -> Result<Box<dyn FastxReader + 'a>, ParseError> {
+    let mut first = [0; 1];
+    reader.read_exact(&mut first)?;
+    let reader = io::Cursor::new(first).chain(reader);
+    match first[0] {
+        b'>' => Ok(Box::new(FastaReader::new(reader))),
+        b'@' => Ok(Box::new(FastqReader::new(reader))),
+        b => Err(ParseError::new_unknown_format(b)),
+    }
 }
 
 // Counts the bytes it delivers (for the watchdog) and keeps the first read error with the count at
@@ -289,7 +314,7 @@ fn stalled(delivered: &AtomicU64, done: Receiver<()>, timeout: Duration) -> bool
 }
 
 // Reads all records into HAECRecords, in file order. With `stop_on_error`, a parse error ends the
-// read and is returned; without it, it panics in place.
+// read and is returned (workers skip the chunks still queued); without it, it panics in place.
 fn read_records<'a>(
     mut reader: Box<dyn FastxReader + 'a>,
     min_length: u32,
@@ -305,15 +330,22 @@ fn read_records<'a>(
     let (recs_sender, recs_receiver) = unbounded::<(usize, Vec<HAECRecord>)>();
     // Workers return emptied chunk buffers, so this thread refills warm memory instead of allocating.
     let (pool_sender, pool_receiver) = unbounded::<(Vec<u8>, Vec<[usize; 3]>)>();
+    // Set only on a parse error with `stop_on_error`: records near a decoder error may be garbage
+    // and must not reach invalid_base_exit before the error is reported.
+    let stopped = AtomicBool::new(false);
 
     thread::scope(|s| {
         for _ in 0..PARSE_WORKERS {
             let chunk_receiver = chunk_receiver.clone();
             let recs_sender = recs_sender.clone();
             let pool_sender = pool_sender.clone();
+            let stopped = &stopped;
 
             s.spawn(move || {
                 for (i, mut buf, mut ends) in chunk_receiver {
+                    if stopped.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let mut recs = Vec::with_capacity(ends.len());
                     let mut start = 0;
                     for &[id_end, seq_end, qual_end] in &ends {
@@ -374,6 +406,7 @@ fn read_records<'a>(
             let record = match record {
                 Ok(record) => record,
                 Err(e) if stop_on_error => {
+                    stopped.store(true, Ordering::Relaxed);
                     parse_error = Some(e);
                     break;
                 }
@@ -397,7 +430,7 @@ fn read_records<'a>(
                 (buf, ends) = pool_receiver.try_recv().unwrap_or_default();
             }
         }
-        if !ends.is_empty() {
+        if !ends.is_empty() && parse_error.is_none() {
             chunk_sender.send((n_chunks, buf, ends)).unwrap();
         }
         drop(chunk_sender);
@@ -828,7 +861,10 @@ mod tests {
     // zlib-rs rejects, is decoded by rapidgzip-core when it takes its parallel (MarkerWindow) path.
     // Repro from hero-perf: tmp/c25eval/repro/hdist31_one_block.gz (35 MB; 83,890,080 B decoded,
     // CRC32 and ISIZE checked by the library).
+    // Ignored: tests the library, depends on its timing-based path choice, needs the repro outside
+    // the crate. Run: cargo test --lib rapidgzip_accepts_hdist31 -- --ignored
     #[test]
+    #[ignore]
     fn rapidgzip_accepts_hdist31() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
