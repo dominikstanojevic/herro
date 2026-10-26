@@ -83,11 +83,6 @@ pub fn get_reads<P: AsRef<Path>>(
                         let id = split.next().expect("Invalid read id.").to_owned();
                         let description = split.next().map(|d| d.to_owned());
 
-                        let seq = match encode(seq) {
-                            Ok((data, length)) => HAECSeq::new(data, length),
-                            Err(i) => invalid_base_exit(seq[i], i, &id),
-                        };
-
                         if let (Some(core), Some(neighbour)) = (&core, &neighbour) {
                             if !neighbour.contains(std::str::from_utf8(&id).unwrap())
                                 && !core.contains(std::str::from_utf8(&id).unwrap())
@@ -95,6 +90,11 @@ pub fn get_reads<P: AsRef<Path>>(
                                 continue;
                             }
                         }
+
+                        let seq = match encode(seq) {
+                            Ok((data, length)) => HAECSeq::new(data, length),
+                            Err(i) => invalid_base_exit(seq[i], i, &id),
+                        };
 
                         recs.push(HAECRecord::new(id, description, seq, qual));
                     }
@@ -228,11 +228,11 @@ fn encode(sequence: &[u8]) -> Result<(Vec<u64>, usize), usize> {
     Ok((data, sequence.len()))
 }
 
-// Called from get_reads' scoped worker threads, before any output exists: exit the whole process
-// here, as a panic would leave the other threads and the in-order chunk reassembly waiting.
+// Called from get_reads' worker threads, before any output exists. Exits with a clear message and
+// exit code 1 instead of a panic (release has panic = "abort": SIGABRT and a panic dump).
 fn invalid_base_exit(base: u8, pos: usize, id: &[u8]) -> ! {
     eprintln!(
-        "Invalid base '{}' at position {} in read {}. HERRO accepts only A, C, G, T (upper or lower case).",
+        "Invalid base '{}' at position {} (0-based) in read {}. HERRO accepts only A, C, G, T (upper or lower case).",
         base.escape_ascii(),
         pos,
         String::from_utf8_lossy(id)
