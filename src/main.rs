@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
-use herro::{error_correction, generate_features, AlnMode};
+use herro::{error_correction, generate_features, AlnMode, GzipDecoder};
 
 use jemallocator::Jemalloc;
 
@@ -54,6 +54,14 @@ struct FeatGenArgs {
     )]
     feat_gen_threads: usize,
 
+    #[arg(
+        long,
+        value_enum,
+        default_value = "rapidgzip",
+        help = "Decoder for gzipped reads (default rapidgzip)"
+    )]
+    gzip_decoder: GzipDecoder,
+
     #[arg(help = "Path to the fastq reads (can be gzipped)")]
     reads: String,
 
@@ -104,6 +112,14 @@ struct InferenceArgs {
     )]
     cluster : String,
 
+    #[arg(
+        long,
+        value_enum,
+        default_value = "rapidgzip",
+        help = "Decoder for gzipped reads (default rapidgzip)"
+    )]
+    gzip_decoder: GzipDecoder,
+
     #[arg(help = "Path to the fastq reads (can be gzipped)")]
     reads: String,
 
@@ -134,6 +150,7 @@ fn main() {
                 args.feat_gen_threads,
                 args.window_size,
                 mode,
+                args.gzip_decoder,
             );
         }
         Commands::Inference(args) => {
@@ -154,6 +171,7 @@ fn main() {
                 args.devices,
                 args.batch_size,
                 mode,
+                args.gzip_decoder,
             );
         }
     }

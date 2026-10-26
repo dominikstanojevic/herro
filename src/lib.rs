@@ -2,6 +2,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use features::extract_features;
 
 use haec_io::HAECRecord;
+pub use haec_io::GzipDecoder;
 
 use pbars::{
     get_parse_reads_spinner, set_parse_reads_spinner_finish, track_progress, PBarNotification,
@@ -53,13 +54,14 @@ pub fn generate_features<T, U, V>(
     threads: usize,
     window_size: u32,
     aln_mode: AlnMode<V>,
+    gzip_decoder: GzipDecoder,
 ) where
     T: AsRef<Path> + Send + Sync,
     U: AsRef<Path> + Send + Sync + Clone,
     V: AsRef<Path> + Send,
 {
     // Get fastq reads
-    let reads = parse_reads(&reads_path, window_size, &None, &None);
+    let reads = parse_reads(&reads_path, window_size, &None, &None, gzip_decoder);
     let max_len = reads.iter().map(|r| r.seq.len()).max().unwrap();
 
     let (alns_sender, alns_receiver) = bounded(ALN_CHANNEL_CAPACITY);
@@ -121,6 +123,7 @@ pub fn error_correction<T, U, V>(
     devices: Vec<usize>,
     batch_size: usize,
     aln_mode: AlnMode<V>,
+    gzip_decoder: GzipDecoder,
 ) where
     T: AsRef<Path> + Send + Sync,
     U: AsRef<Path> + Send + Sync,
@@ -136,7 +139,7 @@ pub fn error_correction<T, U, V>(
         AlnMode::Read(path) => prefetch_first_batch(path),
         _ => None,
     };
-    let reads = parse_reads(&reads_path, window_size, &core, &neighbour);
+    let reads = parse_reads(&reads_path, window_size, &core, &neighbour, gzip_decoder);
     let max_len = reads.iter().map(|r| r.seq.len()).max().unwrap();
 
     let (alns_sender, alns_receiver) = bounded(ALN_CHANNEL_CAPACITY);
@@ -250,12 +253,13 @@ fn parse_reads<P: AsRef<Path>>(
     window_size: u32,
     core: &Option<HashSet<String>>,
     neighbour: &Option<HashSet<String>>,
+    gzip_decoder: GzipDecoder,
 ) -> Vec<HAECRecord> {
     // Get fastq reads
     let spinner = get_parse_reads_spinner(None);
     let md = metadata(&reads_path).unwrap();
     if md.is_file() {
-        let reads = haec_io::get_reads(&reads_path, window_size, core, neighbour);
+        let reads = haec_io::get_reads(&reads_path, window_size, core, neighbour, gzip_decoder);
         set_parse_reads_spinner_finish(reads.len(), spinner);
         reads
     } else {
@@ -264,7 +268,7 @@ fn parse_reads<P: AsRef<Path>>(
             .unwrap()
             .filter_map(|p| p.ok().and_then(|path| path.to_str().map(|s| s.to_owned())))
             .filter(|s| s.ends_with(".fastq") || s.ends_with(".fastq.gz"))
-            .flat_map(|s| haec_io::get_reads(&s, window_size, core, neighbour))
+            .flat_map(|s| haec_io::get_reads(&s, window_size, core, neighbour, gzip_decoder))
             .collect();
         set_parse_reads_spinner_finish(reads.len(), spinner);
         reads
