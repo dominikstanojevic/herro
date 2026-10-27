@@ -6,14 +6,13 @@ use std::{
     ops::RangeBounds,
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        atomic::{AtomicBool, Ordering},
+        Mutex, Once,
     },
     thread,
-    time::Duration,
 };
 
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError};
+use crossbeam_channel::{bounded, unbounded};
 use flate2::read::MultiGzDecoder;
 use needletail::{
     errors::ParseError,
@@ -21,17 +20,15 @@ use needletail::{
     parser::{FastaReader, FastqReader},
     FastxReader,
 };
-use rapidgzip_core::{DecodeError, Decoder};
+use rapidgzip_core::Decoder;
 use rustc_hash::FxHashSet;
 
 // get_reads: worker threads (id split, 2-bit encode, core/neighbour filter) and records per chunk.
 const PARSE_WORKERS: usize = 4;
 const PARSE_CHUNK_SIZE: usize = 64;
 
-// rapidgzip-core: decoder threads (a ceiling; the library adapts below it), and how long the parse
-// may see no decoded bytes before the watchdog stops HERRO (review F1: a worker panic can hang).
+// rapidgzip-core decoder threads (a ceiling; the library adapts below it).
 const RAPIDGZIP_THREADS: usize = 16;
-const RAPIDGZIP_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 // Consecutive Interrupted errors retried before one is passed on as a hard error (see TrackedRead).
 const MAX_INTERRUPTED_RETRIES: u32 = 10;
 
@@ -119,45 +116,29 @@ fn get_reads_rapidgzip(
     core: &Option<FxHashSet<String>>,
     neighbour: &Option<FxHashSet<String>>,
 ) -> Vec<HAECRecord> {
-    let delivered = AtomicU64::new(0);
+    install_rapidgzip_panic_hook();
     let error = Mutex::new(None);
-    let (done_sender, done_receiver) = bounded::<()>(0);
 
-    let result = thread::scope(|s| {
-        s.spawn(|| {
-            if stalled(&delivered, done_receiver, RAPIDGZIP_STALL_TIMEOUT) {
-                eprintln!(
-                    "gzip decoder stalled: no progress for {} s on {}. This is a rapidgzip-core problem; rerun with `--gzip-decoder legacy`.",
-                    RAPIDGZIP_STALL_TIMEOUT.as_secs(),
-                    path.display()
-                );
-                std::process::exit(1);
-            }
-        });
-
-        let decoder = Decoder::builder()
-            .decoder_threads(RAPIDGZIP_THREADS)
-            .build()
-            .expect("Valid rapidgzip-core configuration.");
-        let result = match decoder.open(path) {
-            Ok(inner) => {
-                let tracked = TrackedRead {
-                    inner,
-                    delivered: &delivered,
-                    error: &error,
-                };
-                // The reader (and with it all decoding) is dropped before this returns.
-                decoded_fastx_reader(tracked)
-                    .and_then(|reader| read_records(reader, min_length, core, neighbour, true))
-            }
-            Err(e) => {
-                *error.lock().unwrap() = Some((io::Error::other(e.clone()), 0));
-                Err(ParseError::from(io::Error::other(e)))
-            }
-        };
-        drop(done_sender);
-        result
-    });
+    let decoder = Decoder::builder()
+        .decoder_threads(RAPIDGZIP_THREADS)
+        .build()
+        .expect("Valid rapidgzip-core configuration.");
+    let result = match decoder.open(path) {
+        Ok(inner) => {
+            let tracked = TrackedRead {
+                inner,
+                delivered: 0,
+                error: &error,
+            };
+            // The reader (and with it all decoding) is dropped before this returns.
+            decoded_fastx_reader(tracked)
+                .and_then(|reader| read_records(reader, min_length, core, neighbour, true))
+        }
+        Err(e) => {
+            *error.lock().unwrap() = Some((io::Error::other(e.clone()), 0));
+            Err(ParseError::from(io::Error::other(e)))
+        }
+    };
 
     // Nothing is kept on error: classify, then exit before any output exists.
     result.unwrap_or_else(|parse_error| {
@@ -170,8 +151,30 @@ fn get_reads_rapidgzip(
     })
 }
 
-// Message for a failed rapidgzip read. Unless a decoder thread panicked, re-reads the file with the
-// legacy decoder (this thread, records discarded) to tell a bad file from a rapidgzip-core problem.
+// Release has panic = "abort": a panic in a rapidgzip-core thread ends HERRO at once, so no
+// WorkerPanicked error reaches get_reads. The hook names the culprit, then runs the previous hook
+// (default message, then abort). Installed once per process.
+fn install_rapidgzip_panic_hook() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(msg) = rapidgzip_panic_message(info.location().map(|l| l.file())) {
+                eprintln!("{msg}");
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn rapidgzip_panic_message(file: Option<&str>) -> Option<&'static str> {
+    file.filter(|f| f.contains("rapidgzip-core")).map(|_| {
+        "rapidgzip-core 0.3.1 crashed while decoding the reads file. This is a rapidgzip-core problem; rerun with --gzip-decoder legacy."
+    })
+}
+
+// Message for a failed rapidgzip read. Re-reads the file with the legacy decoder (this thread,
+// records discarded) to tell a bad file from a rapidgzip-core problem.
 fn rapidgzip_failure_message(
     path: &Path,
     decoder_error: Option<(io::Error, u64)>,
@@ -181,19 +184,6 @@ fn rapidgzip_failure_message(
         Some((e, _)) => e.to_string(),
         None => parse_error.to_string(),
     };
-    let panicked = decoder_error.as_ref().is_some_and(|(e, _)| {
-        matches!(
-            e.get_ref().and_then(|e| e.downcast_ref::<DecodeError>()),
-            Some(DecodeError::WorkerPanicked)
-        )
-    });
-    if panicked {
-        return format!(
-            "rapidgzip-core 0.3.1 failed on {}: {}. This is a rapidgzip-core problem, not a problem with the file; rerun with `--gzip-decoder legacy`.",
-            path.display(),
-            rapidgzip_error
-        );
-    }
 
     match legacy_check(path) {
         Ok(()) => format!(
@@ -218,12 +208,11 @@ fn rapidgzip_failure_message(
 // (the decoder parse_fastx_file uses for gzip), keeping nothing. A decoder error carries the
 // decompressed byte offset at which it occurred.
 fn legacy_check(path: &Path) -> Result<(), String> {
-    let delivered = AtomicU64::new(0);
     let error = Mutex::new(None);
     let file = File::open(path).map_err(|e| e.to_string())?;
     let tracked = TrackedRead {
         inner: MultiGzDecoder::new(file),
-        delivered: &delivered,
+        delivered: 0,
         error: &error,
     };
     let result = decoded_fastx_reader(tracked).and_then(|mut reader| {
@@ -254,14 +243,14 @@ fn decoded_fastx_reader<'a, R: Read + Send + 'a>(
     }
 }
 
-// Counts the bytes it delivers (for the watchdog) and keeps the first read error with the count at
-// that point, before passing it on (needletail keeps only the message, or none at all for the
+// Counts the bytes it delivers and keeps the first read error with the count at that point,
+// before passing it on (needletail keeps only the message, or none at all for the
 // first two bytes). rapidgzip-core 0.3.1 returns a failed decode's error on every later read, so an
 // Interrupted error that repeats is final (e.g. EINTR from pread, review F2): it is passed on as a
 // hard error, because needletail and read_exact would retry it forever.
 struct TrackedRead<'a, R> {
     inner: R,
-    delivered: &'a AtomicU64,
+    delivered: u64,
     error: &'a Mutex<Option<(io::Error, u64)>>,
 }
 
@@ -271,7 +260,7 @@ impl<R: Read> Read for TrackedRead<'_, R> {
         loop {
             match self.inner.read(buf) {
                 Ok(n) => {
-                    self.delivered.fetch_add(n as u64, Ordering::Relaxed);
+                    self.delivered += n as u64;
                     return Ok(n);
                 }
                 Err(e)
@@ -286,29 +275,10 @@ impl<R: Read> Read for TrackedRead<'_, R> {
                         kind => kind,
                     };
                     let passed_on = io::Error::new(kind, e.to_string());
-                    let offset = self.delivered.load(Ordering::Relaxed);
-                    self.error.lock().unwrap().get_or_insert((e, offset));
+                    self.error.lock().unwrap().get_or_insert((e, self.delivered));
                     return Err(passed_on);
                 }
             }
-        }
-    }
-}
-
-// Waits until `done` is signalled or disconnected (false) or `delivered` has not changed for at
-// least `timeout` (true).
-fn stalled(delivered: &AtomicU64, done: Receiver<()>, timeout: Duration) -> bool {
-    let mut last = delivered.load(Ordering::Relaxed);
-    loop {
-        match done.recv_timeout(timeout) {
-            Err(RecvTimeoutError::Timeout) => {
-                let now = delivered.load(Ordering::Relaxed);
-                if now == last {
-                    return true;
-                }
-                last = now;
-            }
-            _ => return false,
         }
     }
 }
@@ -601,12 +571,9 @@ mod tests {
     use std::{
         io::{self, Read, Write},
         path::{Path, PathBuf},
-        sync::{atomic::AtomicU64, Mutex},
-        thread,
-        time::{Duration, Instant},
+        sync::Mutex,
     };
 
-    use crossbeam_channel::{bounded, Receiver};
     use flate2::{read::MultiGzDecoder, write::DeflateEncoder, write::GzEncoder, Compression, Crc};
     use needletail::errors::ParseError;
     use rapidgzip_core::{DecodeError, Decoder};
@@ -614,8 +581,8 @@ mod tests {
     use crate::haec_io::HAECSeq;
 
     use super::{
-        decode, encode, get_reads, rapidgzip_failure_message, stalled, GzipDecoder, HAECRecord,
-        TrackedRead, RAPIDGZIP_THREADS,
+        decode, encode, get_reads, rapidgzip_failure_message, rapidgzip_panic_message, GzipDecoder,
+        HAECRecord, TrackedRead, RAPIDGZIP_THREADS,
     };
 
     // Deterministic FASTQ: ids with and without a description, mixed case, lengths 1..~3000.
@@ -759,64 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_is_library_problem_without_reread() {
-        // The path does not exist: a re-read would report it as corrupted.
-        let path = Path::new("/nonexistent/reads.fq.gz");
-        let e = io::Error::other(DecodeError::WorkerPanicked);
-        let msg = rapidgzip_failure_message(path, Some((e, 0)), ParseError::new_empty_file());
-        assert!(msg.contains("not a problem with the file"), "{msg}");
-        assert!(msg.contains("--gzip-decoder legacy"), "{msg}");
-    }
-
-    // Blocks in read until the sender side is dropped, then reports end of file.
-    struct Blocking(Receiver<()>);
-
-    impl Read for Blocking {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            let _ = self.0.recv();
-            Ok(0)
-        }
-    }
-
-    #[test]
-    fn watchdog_fires_when_reader_blocks() {
-        let delivered = AtomicU64::new(0);
-        let error = Mutex::new(None);
-        let (unblock, blocked) = bounded::<()>(0);
-        let (_done_sender, done) = bounded::<()>(0);
-        thread::scope(|s| {
-            s.spawn(|| {
-                let mut r = TrackedRead {
-                    inner: Blocking(blocked),
-                    delivered: &delivered,
-                    error: &error,
-                };
-                r.read(&mut [0; 16]).unwrap();
-            });
-            let start = Instant::now();
-            assert!(stalled(&delivered, done, Duration::from_millis(200)));
-            assert!(start.elapsed() >= Duration::from_millis(200));
-            drop(unblock);
-        });
-    }
-
-    #[test]
-    fn watchdog_quiet_while_progressing_and_stops_when_done() {
-        let delivered = AtomicU64::new(0);
-        let (done_sender, done) = bounded::<()>(0);
-        let timeout = Duration::from_millis(200);
-        thread::scope(|s| {
-            let watchdog = s.spawn(|| stalled(&delivered, done, timeout));
-            // Progress for 3x the timeout, a byte every 20 ms.
-            for _ in 0..30 {
-                thread::sleep(Duration::from_millis(20));
-                delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let end = Instant::now();
-            drop(done_sender);
-            assert!(!watchdog.join().unwrap());
-            assert!(end.elapsed() < Duration::from_millis(100));
-        });
+    fn panic_message_only_for_rapidgzip_core() {
+        let lib = "/home/u/.cargo/registry/src/index.crates.io-x/rapidgzip-core-0.3.1/src/backend.rs";
+        assert_eq!(
+            rapidgzip_panic_message(Some(lib)),
+            Some("rapidgzip-core 0.3.1 crashed while decoding the reads file. This is a rapidgzip-core problem; rerun with --gzip-decoder legacy.")
+        );
+        assert_eq!(rapidgzip_panic_message(Some("src/haec_io.rs")), None);
+        assert_eq!(rapidgzip_panic_message(None), None);
     }
 
     // Returns Interrupted `n` times, then one byte per read.
@@ -835,21 +752,16 @@ mod tests {
 
     #[test]
     fn interrupted_is_retried_then_final() {
-        let delivered = AtomicU64::new(0);
         let error = Mutex::new(None);
         let mut r = TrackedRead {
             inner: Interrupting(3),
-            delivered: &delivered,
+            delivered: 0,
             error: &error,
         };
         assert_eq!(r.read(&mut [0; 4]).unwrap(), 1);
         assert!(error.lock().unwrap().is_none());
 
-        let mut r = TrackedRead {
-            inner: Interrupting(usize::MAX),
-            delivered: &delivered,
-            error: &error,
-        };
+        r.inner = Interrupting(usize::MAX);
         let e = r.read(&mut [0; 4]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Other);
         let (stored, offset) = error.lock().unwrap().take().unwrap();
