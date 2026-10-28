@@ -85,7 +85,7 @@ pub fn get_reads<P: AsRef<Path>>(
     gzip_decoder: GzipDecoder,
 ) -> Vec<HAECRecord> {
     let path = path.as_ref();
-    // Known, accepted difference (Dominik): rapidgzip-core accepts a dynamic block that declares
+    // Known difference: rapidgzip-core accepts a dynamic block that declares
     // 31 or 32 distance codes (HDIST 30/31, allowed by RFC 1951, the extra codes unused), which
     // zlib-rs rejects. On such a file legacy aborts and rapidgzip decodes the CRC-checked bytes.
     // Test: tests::rapidgzip_accepts_hdist31.
@@ -246,7 +246,7 @@ fn decoded_fastx_reader<'a, R: Read + Send + 'a>(
 // Counts the bytes it delivers and keeps the first read error with the count at that point,
 // before passing it on (needletail keeps only the message, or none at all for the
 // first two bytes). rapidgzip-core 0.3.1 returns a failed decode's error on every later read, so an
-// Interrupted error that repeats is final (e.g. EINTR from pread, review F2): it is passed on as a
+// Interrupted error that repeats is final (e.g. EINTR from pread): it is passed on as a
 // hard error, because needletail and read_exact would retry it forever.
 struct TrackedRead<'a, R> {
     inner: R,
@@ -644,7 +644,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("herro-c25-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("herro-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -769,20 +769,19 @@ mod tests {
         assert_eq!(offset, 1);
     }
 
-    // Known, accepted difference C2: a dynamic block declaring 31 distance codes (HDIST 30), which
+    // Known difference: a dynamic block declaring 31 distance codes (HDIST 30), which
     // zlib-rs rejects, is decoded by rapidgzip-core when it takes its parallel (MarkerWindow) path.
-    // Repro from hero-perf: tmp/c25eval/repro/hdist31_one_block.gz (35 MB; 83,890,080 B decoded,
-    // CRC32 and ISIZE checked by the library).
-    // Ignored: tests the library, depends on its timing-based path choice, needs the repro outside
-    // the crate. Run: cargo test --lib rapidgzip_accepts_hdist31 -- --ignored
+    // Test file: one such block (35 MB; 83,890,080 B decoded, CRC32 and ISIZE checked by the
+    // library). Ignored: tests the library, depends on its timing-based path choice, needs the file
+    // outside the crate.
+    // Run: HERRO_HDIST31_GZ=<file> cargo test --lib rapidgzip_accepts_hdist31 -- --ignored
     #[test]
     #[ignore]
     fn rapidgzip_accepts_hdist31() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tmp/c25eval/repro/hdist31_one_block.gz"
-        );
-        assert!(Path::new(path).is_file(), "missing repro {path}");
+        let path =
+            std::env::var("HERRO_HDIST31_GZ").expect("set HERRO_HDIST31_GZ to the test file");
+        let path = path.as_str();
+        assert!(Path::new(path).is_file(), "missing test file {path}");
 
         let mut legacy = MultiGzDecoder::new(std::fs::File::open(path).unwrap());
         assert!(io::copy(&mut legacy, &mut io::sink()).is_err());

@@ -41,7 +41,7 @@ fn run(reads: &Path, out: &Path, decoder: &str) -> (Option<i32>, String) {
 
 #[test]
 fn corrupted_gzip_exits_without_output() {
-    let dir: PathBuf = std::env::temp_dir().join(format!("herro-c25-it-{}", std::process::id()));
+    let dir: PathBuf = std::env::temp_dir().join(format!("herro-test-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let good = gz(&fastq());
@@ -106,7 +106,7 @@ const BZ2_FASTQ: [u8; 59] = [
 // Like parse_fastx_file, the rapidgzip path does not look for a second compression layer.
 #[test]
 fn nested_compression_is_rejected_by_both() {
-    let dir: PathBuf = std::env::temp_dir().join(format!("herro-c25-nest-{}", std::process::id()));
+    let dir: PathBuf = std::env::temp_dir().join(format!("herro-test-nest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     for (name, data) in [("gz_gz", gz(&gz(&fastq()))), ("gz_bz2", gz(&BZ2_FASTQ))] {
