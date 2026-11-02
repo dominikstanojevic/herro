@@ -63,14 +63,14 @@ conda env create --file scripts/herro-env.yml
      
   For R10.4.1 data,
   ```shell
-  wget -O model_R10_v0.1.pt https://zenodo.org/records/12683277/files/model_v0.1.pt?download=1
+  wget -O model_R10_v0.1.2.pt https://zenodo.org/records/23874961/files/R10.v0.1.2.pt?download=1
   ```
   For R9.4.1 data (experimental),
   ```shell
   wget -O model_R9_v0.1.pt https://zenodo.org/records/12683277/files/model_R9_v0.1.pt?download=1
   ```
 
-Models can also be found on Zenodo: [https://zenodo.org/records/12683277](https://zenodo.org/records/12683277)
+Models can also be found on Zenodo: [https://zenodo.org/records/23874961](https://zenodo.org/records/23874961) (R10 v0.1.2) and [https://zenodo.org/records/12683277](https://zenodo.org/records/12683277) (v0.1, including R9)
 
 ## Usage
 
