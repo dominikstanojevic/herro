@@ -1,6 +1,6 @@
 [package]
 name = "herro"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Dominik Stanojevic"]
 edition = "2021"
 description = "HERRO is a haplotype-aware, deep-learning tool for error correction of Nanopore ultralong (UL) reads."
